@@ -1,0 +1,877 @@
+import numpy as np
+
+from tqdm import tqdm
+
+from environment.env import Env
+from environment.vis import Vis
+from environment.enums import TrajItems
+
+
+class MonteCarlo:
+    def __init__(self, gamma: float = 0.9, env: Env = None, vis: Vis = None, render: bool = False):
+        self.gamma = gamma
+        self.env = env
+        self.vis = vis
+        self.render = render
+        self.policy = np.zeros(shape=(self.env.state_space_size, self.env.action_space_size), dtype=float)
+        self.qtable = np.zeros(shape=self.env.state_space_size, dtype=float)
+
+    def mc_basic(self, steps: int = 30, epochs: int = 100, trajectory_numbers: int = 1) -> None:
+        """
+        基本的mc, 遍历每个状态动作对, 并从每个状态动作队采样多个trajectory, 用trajectory的平局奖励作为q(s,a)
+        注意这里采样的多条轨迹是确定且一致的, 因为在某个策略下, 下一个状态要采取动作只有一个概率为1, 其他为0
+        :param steps: trajectory的长度
+        :param epochs: 迭代次数
+        :param trajectory_numbers: 每个状态动作对采集的trajectory的数量
+        :return: None
+        """
+        # initial guess π0
+        self.init_policy()
+
+        # for the kth iteration (k = 0, 1, 2, . . .), do
+        for _ in tqdm(range(epochs)):
+
+            # for every state s ∈ S
+            for state in self.env.state_space:
+                qsa = np.zeros(shape=self.env.action_space_size, dtype=float)
+
+                # for every action a ∈ A(s)
+                for action in self.env.action_space:
+
+                    # collect sufficiently many episodes starting from (s, a) by following πk
+                    gs = np.zeros(shape=trajectory_numbers, dtype=float)
+                    for traj_index in range(trajectory_numbers):
+                        traj = self.env.episode(self.policy, state, action, steps)[::-1, :]
+                        for step in range(steps):
+                            gs[traj_index] = traj[step, TrajItems.REWARD.value] + self.gamma * gs[traj_index]
+
+                    # qπk(s, a) ≈ qk(s, a) = the average return of all the episodes starting from(s, a)
+                    qsa[action] = gs.mean()
+                self.policy[state] = np.zeros(shape=self.env.action_space_size)
+                self.policy[state, np.argmax(qsa)] = 1
+                self.qtable[state] = np.max(qsa)
+        if self.render:
+            self.vis.show_policy(self.policy)
+            self.vis.show_value(self.qtable)
+            self.vis.show()
+
+    def mc_exploring_starts(self, steps: int = 30, epochs: int = 100) -> None:
+        """
+        为了保证每个状态动作对都访问到, 使用了遍历。这个算法整体来说只能说提高了数据利用率, 效果很差
+        :param steps: trajectory的长度
+        :param epochs: 迭代次数
+        :return: None
+        """
+        # initial policy π0(a|s). returns(s, a) =0 and num(s, a) = 0 for all (s, a).
+        self.init_policy()
+        returns = np.zeros(shape=(self.env.state_space_size, self.env.action_space_size), dtype=float)
+        nums = np.zeros(shape=(self.env.state_space_size, self.env.action_space_size), dtype=int)
+
+        # for each episode, do
+        for _ in tqdm(range(epochs)):
+
+            # for every state s ∈ S
+            for state in self.env.state_space:
+                qsa = np.zeros(shape=self.env.action_space_size, dtype=float)
+
+                # for every action a ∈ A(s)
+                for action in self.env.action_space:
+                    traj = self.env.episode(self.policy, state, action, steps)[::-1, :]
+                    g = 0
+                    for step in range(steps):
+                        # g ← γg + rt+1
+                        g = traj[step, TrajItems.REWARD.value] + self.gamma * g
+                        traj_state = int(traj[step, TrajItems.STATE.value])
+                        traj_action = int(traj[step, TrajItems.ACTION.value])
+
+                        # returns(st, at) ← returns(st, at) + g
+                        returns[traj_state, traj_action] += g
+
+                        # num(st, at) ← num(st, at) + 1
+                        nums[traj_state, traj_action] += 1
+
+                        # policy evaluation
+                        qsa[traj_action] = returns[traj_state, traj_action] / nums[traj_state, traj_action]
+
+                        # policy improvement
+                        self.policy[traj_state] = np.zeros(shape=self.env.action_space_size)
+                        self.policy[traj_state, np.argmax(qsa)] = 1
+
+                        self.qtable[traj_state] = np.max(qsa)
+        if self.render:
+            self.vis.show_policy(self.policy)
+            self.vis.show_value(self.qtable)
+            self.vis.show()
+
+    def mc_epsilon_greedy(self, steps: int = 20, epochs: int = 100, epsilon: float = 0.1):
+        """
+        非傻贪婪
+        :param steps: trajectory的长度
+        :param epochs: 迭代次数
+        :param epsilon: 探索率
+        :return:
+        """
+        # initial policy π0(a|s). returns(s, a) =0 and num(s, a) = 0 for all (s, a).
+        self.init_policy()
+        returns = np.zeros(shape=(self.env.state_space_size, self.env.action_space_size), dtype=float)
+        nums = np.zeros(shape=(self.env.state_space_size, self.env.action_space_size), dtype=int)
+
+        # for each episode, do
+        for _ in tqdm(range(epochs)):
+            state = np.random.choice(self.env.state_space)
+            action = np.random.choice(self.env.action_space)
+
+            qsa = np.zeros(shape=self.env.action_space_size, dtype=float)
+
+            traj = self.env.episode(self.policy, state, action, steps)[::-1, :]
+            g = 0
+            for step in range(steps):
+                # g ← γg + rt+1
+                g = traj[step, TrajItems.REWARD.value] + self.gamma * g
+
+                traj_state = int(traj[step, TrajItems.STATE.value])
+                traj_action = int(traj[step, TrajItems.ACTION.value])
+
+                # returns(st, at) ← returns(st, at) + g
+                returns[traj_state, traj_action] += g
+
+                # num(st, at) ← num(st, at) + 1
+                nums[traj_state, traj_action] += 1
+
+                # policy evaluation
+                qsa[traj_action] = returns[traj_state, traj_action] / nums[traj_state, traj_action]
+
+                # policy improvement
+                other_probability = epsilon * (1 / self.env.action_space_size)
+                self.policy[traj_state] = np.ones(shape=self.env.action_space_size) * other_probability
+                self.policy[traj_state, np.argmax(qsa)] = 1 - other_probability * (self.env.action_space_size - 1)
+
+                self.qtable[traj_state] = np.max(qsa)
+
+        if self.render:
+            self.vis.show_policy(self.policy)
+            self.vis.show_value(self.qtable)
+            self.vis.show()
+
+    def init_policy(self) -> None:
+        """
+        随机初始化策略
+        :return: None
+        """
+        random_action = np.random.randint(self.env.action_space_size, size=self.env.state_space_size)
+        for state, action in enumerate(random_action):
+            self.policy[state, action] = 1
+
+
+if __name__ == "__main__":
+    start_state = [0, 0]
+    target_state = [2, 3]
+    forbid = [[2, 2], [2, 1], [1, 1], [3, 3], [1, 3], [1, 4]]
+    model = MonteCarlo(vis=Vis(target_state=target_state, forbid=forbid),
+                       env=Env(target_state=target_state, forbid=forbid),
+                       render=True)
+    model.mc_basic()
+    # model.mc_exploring_starts()
+    # model.mc_epsilon_greedy()
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+import numpy as np
+
+from environment.env import Env
+from environment.vis import Vis
+
+
+class PolicyIteration:
+    def __init__(self, gamma: float = 0.9, env: Env = None, vis: Vis = None, render: bool = False):
+        self.gamma = gamma
+        self.env = env
+        self.vis = vis
+        self.render = render
+        self.policy = np.zeros(shape=(self.env.state_space_size, self.env.action_space_size), dtype=int)
+        self.qtable = np.zeros(shape=self.env.state_space_size, dtype=float)
+
+    def policy_iteration(self, policy_threshold: float = 0.01, value_threshold: float = 0.01, steps: int = 10) -> None:
+        """
+        step 1:从初始策略开始，求解该策略对应的全局状态价值(在这个过程中本来要无穷次迭代得到真正的状态价值，但实际会设置阈值，截断策略迭代算法)
+        step 2:拿到第K次迭代对应的策略求解出的全局状态价值之后，利用该价值作为初始值，再进行全局状态价值优化以及策略优化
+        这个过程其实相较于值迭代比较难理解
+
+        Q1:In the policy evaluation step, how to get the state value vπk by solving the Bellman equation?
+        A1:x=f(x)这种满足Contraction Mapping Theorem的迭代求解方式(也可以解析解matrix vector form，但是涉及矩阵逆运算会很慢)
+        Q2*:In the policy improvement step, why is the new policy πk+1 better than πk?
+        A2:直观上不是很好理解就得利用数学工具了，赵老师原著Chapter4.P73页对比了前后两次迭代证明了Vπk - Vπk+1 < 0
+        Q3*:Why can this algorithm finally converge to an optimal policy?
+        A3:Chapter4.P75页不仅证明了能达到最优，而且引入这种PE过程会收敛得更快，证明了Vπk>Vk，同一个迭代timing，策略迭代状态价值更接近最优
+
+        :param policy_threshold: 策略阈值
+        :param value_threshold: 全局状态价值阈值
+        :param steps: 截断的最大迭代次数，只用阈值也行，但这样更方便说明
+        :return: None
+        """
+        policy_differ = np.inf
+        # initial guess π0
+        self.init_policy()
+        # while the policy has not converged, for the kth iteration, do
+        while policy_differ > policy_threshold:
+            kth_policy = self.policy.copy()
+            # step 1: policy evaluation
+            value_differ = np.inf
+            # while v(j)πk has not converged, for the jth iteration, do
+            while value_differ > value_threshold and steps > 0:
+                steps -= 1
+                kth_qtable = self.qtable.copy()
+                # for every state s ∈ S, do
+                for state in self.env.state_space:
+                    state_value = 0
+                    for action in self.env.action_space:
+                        state_value += self.policy[state, action] * self.calculate_qvalue(state, action)
+                    # 当前策略计算出来的当前状态的价值
+                    self.qtable[state] = state_value
+                value_differ = np.linalg.norm(kth_qtable - self.qtable, ord=1)
+            # step 2: policy improvement 相当于上面的PE给下面提供了一个初始状态(对应策略)，之前值迭代的时候是全0为初始值
+            value_differ = np.inf
+            while value_differ > value_threshold:
+                kth_qtable = self.qtable.copy()
+                # for every state s ∈ S, do
+                for state in self.env.state_space:
+                    qsa = np.zeros(shape=self.env.action_space_size, dtype=float)
+                    # for every action a ∈ A(s), do
+                    for action in self.env.action_space:
+                        qsa[action] = self.calculate_qvalue(state, action)
+                    # policy update : πk + 1(a | s) = 1 if a = ak* else πk + 1(a | s) = 0
+                    self.policy[state] = np.zeros(shape=self.env.action_space_size)
+                    self.policy[state, np.argmax(qsa)] = 1
+                    # value update : 状态价值 = 最大的 状态动作 价值
+                    self.qtable[state] = np.max(qsa)
+                value_differ = np.linalg.norm(kth_qtable - self.qtable, ord=1)
+            policy_differ = np.linalg.norm(kth_policy - self.policy, ord=1)
+        if self.render:
+            self.vis.show_policy(self.policy)
+            self.vis.show_value(self.qtable)
+            self.vis.show()
+
+    def init_policy(self) -> None:
+        """
+        之前值迭代可以不用初始化，因为只对policy进行了更新，现在策略迭代得初始化，因为首先就要利用policy进行PE
+        :return: None
+        """
+        random_action = np.random.randint(self.env.action_space_size, size=self.env.state_space_size)
+        for state, action in enumerate(random_action):
+            self.policy[state, action] = 1
+
+    def calculate_qvalue(self, state: int, action: int) -> float:
+        """
+        计算状态动作价值函数的元素展开式, 这里就能理解为什么环境模型为什么是这样的数据结构
+        :param state: 当前状态
+        :param action: 当前动作
+        :return: 当前的状态动作价值
+        """
+        qvalue = 0
+        # immediately reward: sigma(r * p(r | s, a))
+        for reward_type in range(self.env.reward_space_size):
+            qvalue += self.env.reward_space[reward_type] * self.env.rewards_model[state, action, reward_type]
+        # next state expected reward : sigma(vk(s') * p(s' | s, a))
+        for next_state in range(self.env.state_space_size):
+            qvalue += self.gamma * self.env.states_model[state, action, next_state] * self.qtable[next_state]
+        return qvalue
+
+
+if __name__ == "__main__":
+    start_state = [0, 0]
+    target_state = [2, 3]
+    forbid = [[2, 2], [2, 1], [1, 1], [3, 3], [1, 3], [1, 4]]
+    model = PolicyIteration(vis=Vis(target_state=target_state, forbid=forbid),
+                            env=Env(target_state=target_state, forbid=forbid),
+                            render=True)
+    model.policy_iteration()
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+from environment.env import Env
+from environment.vis import Vis
+from environment.enums import TrajItems
+from environment.utils import Utils
+
+
+class TemporalDifference:
+    def __init__(self, gamma: float = 0.9, env: Env = None, vis: Vis = None, render: bool = False):
+        self.gamma = gamma
+        self.env = env
+        self.vis = vis
+        self.render = render
+        self.policy = np.zeros(shape=(self.env.state_space_size, self.env.action_space_size), dtype=float)
+        self.qtable = np.zeros(shape=(self.env.state_space_size, self.env.action_space_size), dtype=float)
+
+    def sarsa(self, lr: float = 0.01, epsilon_max: float = 0.1, epochs: int = 10000, expected_sarsa: bool = False):
+        self.init_policy()
+        state = self.env.reset()
+        action = np.random.choice(self.env.action_space, p=self.policy[state])
+        total_rewards = np.zeros(shape=epochs, dtype=float)
+        episode_lengths = np.zeros(shape=epochs, dtype=int)
+        for epoch in tqdm(range(epochs)):
+            epsilon = ((epochs - epoch) / epochs) * epsilon_max
+            rewards = 0
+            lengths = 0
+            while True:
+                next_state, reward, done = self.env.step(action)
+                next_action = np.random.choice(self.env.action_space, p=self.policy[next_state])
+
+                # update q-value for (st, at):
+                if expected_sarsa:
+                    expected_qsa = 0
+                    for next_action_ in self.env.action_space:
+                        expected_qsa += self.policy[next_state, next_action_] * self.qtable[next_state, next_action_]
+                    td_target = reward + self.gamma * expected_qsa
+                else:
+                    td_target = reward + self.gamma * self.qtable[next_state, next_action]
+                td_error = self.qtable[state, action] - td_target
+                self.qtable[state, action] = self.qtable[state, action] - lr * td_error
+
+                # update policy for st:
+                other_prob = epsilon * (1 / self.env.action_space_size)
+                self.policy[state] = np.ones(shape=self.env.action_space_size) * other_prob
+                self.policy[state, np.argmax(self.qtable[state])] = 1 - other_prob * (self.env.action_space_size - 1)
+
+                # st ← st+1, at ← at+1
+                state = next_state
+                action = next_action
+
+                rewards += reward
+                lengths += 1
+
+                if done:
+                    state = self.env.reset()
+                    break
+
+            total_rewards[epoch] = rewards
+            episode_lengths[epoch] = lengths
+        if self.render:
+            self.show_rewards_episodes(total_rewards, episode_lengths)
+            # self.vis.show_policy(self.policy)
+            # self.vis.show_value(np.max(self.qtable, axis=1))
+            # self.vis.show()
+
+    def q_learning_on_policy(self, lr: float = 0.01, epsilon_max: float = 0.1, epochs: int = 10000):
+        self.init_policy()
+        state = self.env.reset()
+        action = np.random.choice(self.env.action_space, p=self.policy[state])
+        total_rewards = np.zeros(shape=epochs, dtype=float)
+        episode_lengths = np.zeros(shape=epochs, dtype=int)
+        for epoch in tqdm(range(epochs)):
+            epsilon = ((epochs - epoch) / epochs) * epsilon_max
+            rewards = 0
+            lengths = 0
+            while True:
+                next_state, reward, done = self.env.step(action)
+                next_action = np.random.choice(self.env.action_space, p=self.policy[next_state])
+
+                # update q-value for (st, at):
+                td_target = reward + self.gamma * np.max(self.qtable[next_state])
+                td_error = self.qtable[state, action] - td_target
+                self.qtable[state, action] = self.qtable[state, action] - lr * td_error
+
+                # update policy for st:
+                other_prob = epsilon * (1 / self.env.action_space_size)
+                self.policy[state] = np.ones(shape=self.env.action_space_size) * other_prob
+                self.policy[state, np.argmax(self.qtable[state])] = 1 - other_prob * (self.env.action_space_size - 1)
+
+                # st ← st+1, at ← at+1
+                state = next_state
+                action = next_action
+
+                rewards += reward
+                lengths += 1
+
+                if done:
+                    state = self.env.reset()
+                    break
+
+            total_rewards[epoch] = rewards
+            episode_lengths[epoch] = lengths
+        if self.render:
+            self.show_rewards_episodes(total_rewards, episode_lengths)
+            # self.vis.show_policy(self.policy)
+            # self.vis.show_value(np.max(self.qtable, axis=1))
+            # self.vis.show()
+
+    def q_learning_off_policy(self, lr: float = 0.01, epochs: int = 10000, steps: int = 500):
+        # initial  πb
+        self.init_fair_policy()
+        state = self.env.reset()
+        action = np.random.choice(self.env.action_space, p=self.policy[state])
+        # sample
+        # trajectories = np.zeros(shape=(epochs, steps, self.env.trajectory_space_size), dtype=float)
+        # for epoch in tqdm(range(epochs)):
+        #     trajectories[epoch] = self.env.episode(self.policy, state, action, steps)
+        # np.save("trajectories.npy", trajectories)
+        trajectories = np.load("trajectories.npy")
+        # initial πT
+        self.init_policy()
+        total_rewards = np.zeros(shape=epochs, dtype=float)
+        episode_lengths = np.zeros(shape=epochs, dtype=int)
+        for epoch in tqdm(range(epochs)):
+            trajectory = trajectories[epoch]
+            rewards = 0
+            lengths = 0
+            for step in range(steps):
+                # offline
+                state = int(trajectory[step, TrajItems.STATE.value])
+                action = int(trajectory[step, TrajItems.ACTION.value])
+                reward = trajectory[step, TrajItems.REWARD.value]
+                next_state = int(trajectory[step, TrajItems.NEXT_STATE.value])
+                if state == Utils.pos2index(*self.env.target_state, self.env.size):
+                    break
+
+                # update q-value for (st, at):
+                td_target = reward + self.gamma * np.max(self.qtable[next_state])
+                td_error = self.qtable[state, action] - td_target
+                self.qtable[state, action] = self.qtable[state, action] - lr * td_error
+
+                # update policy for st:
+                self.policy[state] = np.zeros(shape=self.env.action_space_size)
+                self.policy[state, np.argmax(self.qtable[state])] = 1
+
+                rewards += reward
+                lengths += 1
+
+            total_rewards[epoch] = rewards
+            episode_lengths[epoch] = lengths
+
+        if self.render:
+            # self.show_rewards_episodes(total_rewards, episode_lengths)
+            self.vis.show_policy(self.policy)
+            self.vis.show_value(np.max(self.qtable, axis=1))
+            self.vis.show()
+
+    @staticmethod
+    def show_rewards_episodes(total_rewards: np.ndarray, episode_lengths: np.ndarray) -> None:
+        plt.clf()
+        fig = plt.subplot(2, 1, 1)
+        xs = range(total_rewards.size)
+        ys = total_rewards
+        fig.plot(xs, ys)
+        plt.xticks(range(total_rewards.size, 10))
+        plt.xlabel("epoch")
+        plt.ylabel("total_rewards")
+        fig.set_title("total_rewards per epoch")
+        fig = plt.subplot(2, 1, 2)
+        xs = range(episode_lengths.size)
+        ys = episode_lengths
+        fig.plot(xs, ys)
+        plt.xticks(range(total_rewards.size, 10))
+        plt.xlabel("epoch")
+        plt.ylabel("episode_lengths")
+        fig.set_title("episode_lengths per epoch")
+        plt.show()
+        plt.pause(100)
+
+    def init_policy(self) -> None:
+        """
+        随机初始化策略
+        :return: None
+        """
+        random_action = np.random.randint(self.env.action_space_size, size=self.env.state_space_size)
+        for state, action in enumerate(random_action):
+            self.policy[state, action] = 1
+
+    def init_fair_policy(self) -> None:
+        """
+        没有先验知识的情况下, 人人平等的策略
+        :return: None
+        """
+        self.policy.fill(1 / self.env.action_space_size)
+
+
+if __name__ == "__main__":
+    start_state = [0, 0]
+    target_state = [2, 3]
+    forbid = [[2, 2], [2, 1], [1, 1], [3, 3], [1, 3], [1, 4]]
+    model = TemporalDifference(vis=Vis(start_state=start_state, target_state=target_state, forbid=forbid),
+                               env=Env(start_state=start_state, target_state=target_state, forbid=forbid),
+                               render=True)
+    # model.sarsa(expected_sarsa=False)
+    # model.q_learning_on_policy()
+    model.q_learning_off_policy()
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+import numpy as np
+
+from environment.env import Env
+from environment.vis import Vis
+
+
+class ValueIteration:
+    def __init__(self, gamma: float = 0.9, env: Env = None, vis: Vis = None, render: bool = False):
+        self.gamma = gamma
+        self.env = env
+        self.vis = vis
+        self.render = render
+        self.policy = np.zeros(shape=(self.env.state_space_size, self.env.action_space_size), dtype=int)
+        self.qtable = np.zeros(shape=self.env.state_space_size, dtype=float)
+
+    def value_iteration(self, threshold: float = 0.01) -> None:
+        """
+        计算每个状态动作对的状态动作价值，然后每个状态选择最大的值对应的动作作为自己的策略，并将值作为自己的状态价值
+        根据Contraction Mapping Theorem, qsa的计算公式满足该理论要求，通过迭代不断优化全局状态价值，并找到对应的最优策略
+        :param threshold: 迭代结束的阈值，前后两次迭代后的全局状态价值的欧氏距离相差小于该阈值时代表优化空间已经不大，结束优化
+        :return: None
+        """
+        differ = np.inf
+        # while vk has not converged in the sense that ||vk − vk−1|| is greater than a predefined small threshold, do
+        while differ > threshold:
+            kth_qtable = self.qtable.copy()
+            # for every state s ∈ S, do
+            for state in self.env.state_space:
+                qsa = np.zeros(shape=self.env.action_space_size, dtype=float)
+                # for every action a ∈ A(s), do
+                for action in self.env.action_space:
+                    qsa[action] = self.calculate_qvalue(state, action)
+                # policy update : πk + 1(a | s) = 1 if a = ak* else πk + 1(a | s) = 0
+                self.policy[state] = np.zeros(shape=self.env.action_space_size)
+                self.policy[state, np.argmax(qsa)] = 1
+                # value update : 状态价值 = 最大的 状态动作 价值
+                self.qtable[state] = np.max(qsa)
+            differ = np.linalg.norm(kth_qtable - self.qtable, ord=1)
+        if self.render:
+            self.vis.show_policy(self.policy)
+            self.vis.show_value(self.qtable)
+            self.vis.show()
+
+    def calculate_qvalue(self, state: int, action: int) -> float:
+        """
+        计算状态动作价值函数的元素展开式, 这里就能理解为什么环境模型为什么是这样的数据结构
+        :param state: 当前状态
+        :param action: 当前动作
+        :return: 当前的状态动作价值
+        """
+        qvalue = 0
+        # immediately reward: sigma(r * p(r | s, a))
+        for reward_type in range(self.env.reward_space_size):
+            qvalue += self.env.reward_space[reward_type] * self.env.rewards_model[state, action, reward_type]
+        # next state expected reward : sigma(vk(s') * p(s' | s, a))
+        for next_state in range(self.env.state_space_size):
+            qvalue += self.gamma * self.env.states_model[state, action, next_state] * self.qtable[next_state]
+        return qvalue
+
+
+if __name__ == "__main__":
+    start_state = [0, 0]
+    target_state = [2, 3]
+    forbid = [[2, 2], [2, 1], [1, 1], [3, 3], [1, 3], [1, 4]]
+    model = ValueIteration(vis=Vis(target_state=target_state, forbid=forbid),
+                           env=Env(target_state=target_state, forbid=forbid),
+                           render=True)
+    model.value_iteration()
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+from enum import Enum
+
+
+class RewardType(Enum):
+    NORMAL = 0
+    TARGET = 1
+    FORBID = 2
+    OUTSIDE = 3
+
+
+class TrajItems(Enum):
+    STATE = 0
+    ACTION = 1
+    REWARD = 2
+    NEXT_STATE = 3
+    NEXT_ACTION = 4
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+import numpy as np
+
+from typing import Tuple
+from environment.utils import Utils
+from environment.enums import RewardType
+from environment.enums import TrajItems
+
+
+class Env:
+    # 动作: 不动, 上, 下, 左, 右
+    actions = [[0, 0], [-1, 0], [1, 0], [0, -1], [0, 1]]
+    action_mapper = np.array([np.array(action) for action in actions])
+
+    def __init__(self, size: int = 5, forbid: list = None, target_state: list = None, start_state: list = None):
+        """
+        环境
+        动作，状态，奖励，环境模型
+        :param size: 地图大小
+        """
+        self.size = size
+        # 初始状态与目标状态
+        self.start_state = start_state
+        self.target_state = target_state
+
+        # 禁止区域
+        self.forbid = forbid
+
+        # 动作空间
+        self.action_space_size = len(self.actions)
+        self.action_space = np.arange(self.action_space_size)
+
+        # 状态空间: 每个格子, 左到右, 上到下拉成一维的
+        self.state_space_size = self.size * self.size
+        self.state_space = np.arange(self.state_space_size)
+
+        # 奖励设定: 禁止区域扣10分,到达终点1分, 走路没惩罚, 但因为gamma的存在, 路径越长, 奖励越低
+        self.reward_space = np.array([-1, 0, -10, -10])
+        self.reward_space_size = 4
+
+        # 环境模型: 任意的s跟a对应的p(r|s,a)与p(s'|s,a)
+        self.rewards_model = None
+        self.states_model = None
+        self.init_model()
+
+        # 轨迹长度
+        self.trajectory_space_size = len(TrajItems.__members__)
+
+        # 交互相关
+        self.state = None
+        self.done = False
+        self.info = None
+
+    def init_model(self) -> None:
+        """
+        初始化环境模型p(r|s,a) p(s''|s,a)
+        :return: None
+        """
+        states_model_shape = (self.state_space_size, self.action_space_size, self.state_space_size)
+        rewards_model_shape = (self.state_space_size, self.action_space_size, self.reward_space_size)
+        self.states_model = np.zeros(shape=states_model_shape, dtype=float)
+        self.rewards_model = np.zeros(shape=rewards_model_shape, dtype=float)
+
+        for state in self.state_space:
+            for action in self.action_space:
+                next_state_pos, inside = self.next_state_pos(state, action)
+                if not inside:
+                    reward_type = RewardType.OUTSIDE
+                else:
+                    if Utils.arr_equal(next_state_pos, self.target_state):
+                        reward_type = RewardType.TARGET
+                    elif Utils.arr_contains(self.forbid, next_state_pos):
+                        reward_type = RewardType.FORBID
+                    else:
+                        reward_type = RewardType.NORMAL
+                # 前状态state采取当前动作action转移到next_state的概率为1
+                self.states_model[state, action, Utils.pos2index(*next_state_pos, self.size)] = 1
+                # 当前状态state采取当前动作action获得该种奖励类型reward_type的概率为1
+                self.rewards_model[state, action, reward_type.value] = 1
+
+    def next_state_pos(self, state: int, action: int) -> Tuple[list, bool]:
+        """
+        在当前状态根据动作获取下一个状态
+        :param state: 当前状态
+        :param action: 当前动作
+        :return: 下一个状态(越界返回当前状态)的坐标; 执行当前动作后是否还在地图内
+        """
+        pos = np.array(Utils.index2pos(state, self.size))
+        next_pos = pos + self.action_mapper[action]
+
+        inside = bool((0 <= next_pos[0] <= self.size - 1) and (0 <= next_pos[1] <= self.size - 1))
+
+        next_state_pos = [*next_pos] if inside else [*pos]
+
+        return next_state_pos, inside
+
+    def episode(self, policy: np.ndarray, state: int, action: int, steps: int) -> np.ndarray:
+        """
+        根据当前策略从当前状态以及当前动作出发, 生成一个trajectory
+        :param policy: 当前策略
+        :param state: 当前状态
+        :param action: 当前动作
+        :param steps: 轨迹长度
+        :return: 轨迹
+        """
+        # 存的是state, action, reward, next_state, next_action --> sarsa
+        trajectory = np.zeros(shape=(steps, self.trajectory_space_size), dtype=float)
+        next_state, next_action = state, action
+        for step in range(steps):
+            state, action = next_state, next_action
+
+            # 获取概率为1的奖励的具体值
+            reward_type = np.where(self.rewards_model[state, action] == 1)
+            reward = self.reward_space[reward_type].item()
+
+            next_state_pos, _ = self.next_state_pos(state, action)
+            next_state = Utils.pos2index(*next_state_pos, self.size)
+
+            next_action = np.random.choice(self.action_space, p=policy[next_state])
+
+            trajectory[step] = np.array([state, action, reward, next_state, next_action])
+
+        return trajectory
+
+    def reset(self) -> int:
+        self.done = False
+        self.state = Utils.pos2index(*self.start_state, self.size)
+        return self.state
+
+    def step(self, action: int):
+        reward_type = np.where(self.rewards_model[self.state, action] == 1)
+        reward = self.reward_space[reward_type].item()
+
+        next_state_pos, _ = self.next_state_pos(self.state, action)
+        next_state = Utils.pos2index(*next_state_pos, self.size)
+        self.state = next_state
+
+        if self.state == Utils.pos2index(*self.target_state, self.size):
+            self.done = True
+
+        return self.state, reward, self.done
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+class Utils:
+    def __init__(self):
+        pass
+
+    @staticmethod
+    def index2pos(pos: int, size: int) -> tuple:
+        """
+        将一维序列对应下标pos的转换到边长为size的二维矩形内的坐标xy
+        :param pos: 一维序列对应下标
+        :param size: 矩形边长
+        :return: 二维矩阵内的坐标xy
+        """
+        x, y = pos // size, pos % size
+        return x, y
+
+    @staticmethod
+    def pos2index(x: int, y: int, size: int) -> int:
+        """
+        边长为size的二维矩形内的坐标xy转换到一维序列对应下标pos
+        :param x: x
+        :param y: y
+        :param size: 矩形边长
+        :return: 一维序列对应下标
+        """
+        pos = x * size + y
+        return pos
+
+    @staticmethod
+    def arr_equal(a: list, b: list) -> bool:
+        """
+        判断两个列表是否相等
+        :param a: 列表a
+        :param b: 列表b
+        :return: 是否相等
+        """
+        if len(a) != len(b):
+            return False
+        for i in range(len(a)):
+            if a[i] != b[i]:
+                return False
+        return True
+
+    @staticmethod
+    def arr_contains(high_dim: list, low_dim: list) -> bool:
+        """
+        判断一个一位列表是否是另一个二维列表的子列表
+        :param high_dim: 二维列表
+        :param low_dim: 一维列表
+        :return: 是否是
+        """
+        for arr in high_dim:
+            if Utils.arr_equal(low_dim, arr):
+                return True
+        return False
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+
+import numpy as np
+from typing import Union
+
+from environment.utils import Utils
+from environment.env import Env
+
+
+class Vis:
+    def __init__(self, size: int = 5, forbid: list = None, target_state: list = None, start_state: list = None):
+        self.size = size
+        self.forbid = forbid
+        self.target_state = target_state
+        self.start_state = start_state
+
+        self.fig = plt.figure(figsize=(5, 5))
+        self.ax = plt.gca()
+        self.ax.xaxis.set_ticks(range(self.size + 1))
+        self.ax.yaxis.set_ticks(range(self.size + 1))
+        self.ax.invert_yaxis()
+        self.rect_width = 1
+        self.init()
+
+    def init(self):
+        for pos in range(self.size * self.size):
+            xy = [*Utils.index2pos(pos, self.size)]
+            self.draw_rect(xy, "#cccccc", fill=False, alpha=0.2)
+
+        for forbid in self.forbid:
+            self.draw_rect(forbid, "#DC143C")
+
+        if self.start_state:
+            self.draw_rect(self.start_state, "#00FF7F")
+        self.draw_rect(self.target_state, "#00FF7F")
+
+    def draw_rect(self, pos: list, color: str, fill: bool = True, alpha: float = 1.0):
+        self.ax.add_patch(patches.Rectangle(
+            xy=(pos[0], pos[1]),
+            width=self.rect_width,
+            height=self.rect_width,
+            facecolor=color,
+            fill=fill,
+            alpha=alpha
+        ))
+
+    def draw_arrow(self, pos: int, direction: [list, np.ndarray], color: str):
+        """
+        绘制表示策略的箭头
+        :param pos: 位置
+        :param color: 颜色
+        :param direction: 箭头朝向
+        :return: None
+        """
+        arrow_offset = self.rect_width / 2
+        x, y = Utils.index2pos(pos, self.size)
+        self.ax.add_patch(patches.Arrow(
+            x=x + arrow_offset,
+            y=y + arrow_offset,
+            dx=direction[0],
+            dy=direction[1],
+            color=color,
+            width=0.2,
+            linewidth=0.5
+        ))
+
+    def draw_circle(self, pos: int, color: str, radius: float):
+        circle_offset = self.rect_width / 2
+        x, y = Utils.index2pos(pos, self.size)
+        self.ax.add_patch(patches.Circle(
+            xy=(x + circle_offset, y + circle_offset),
+            radius=radius,
+            facecolor=color,
+            linewidth=1,
+        ))
+
+    def draw_text(self, pos: int, text: str):
+        circle_offset = self.rect_width / 4
+        x, y = Utils.index2pos(pos, self.size)
+        self.ax.text(x + circle_offset, y + circle_offset, text, size=10, ha='center', va='center')
+
+    def show_policy(self, policy: Union[list, np.ndarray]):
+        for state, action in enumerate(policy):
+            action = np.argmax(action)
+            direction = Env.action_mapper[action] * 0.4
+            if action:
+                self.draw_arrow(state, direction, "green")
+            else:
+                self.draw_circle(state, "green", 0.06)
+
+    def show_value(self, values: np.ndarray):
+        for state, value in enumerate(values):
+            self.draw_text(state, str(round(value, 1)))
+
+
+    def show(self):
+        self.fig.show()
+        plt.pause(100)
