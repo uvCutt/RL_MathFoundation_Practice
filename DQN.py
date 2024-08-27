@@ -18,16 +18,16 @@ class Params:
     # 动作空间和状态空间以及隐藏层大小
     action_space_size = 0
     state_space_size = 0
-    hidden_dim = 256
+    hidden_dim = 128
     # 学习率和折扣率
-    lr = 0.001
+    lr = 0.0001
     gamma = 0.99
 
     # 探索率
     epsilon = 0.01
 
     # 训练次数以及每次最大步长
-    epochs = 400
+    epochs = 1000
     episode_len = 200
     # 经验回放池大小
     replay_buffer_size = 1000
@@ -137,7 +137,7 @@ class DQN:
         """
         if random.random() > self.epsilon:
             with torch.no_grad():
-                state = torch.tensor([state], dtype=torch.float).to(self.params.device)
+                state = torch.tensor(state).to(self.params.device)
                 action_values = self.policy(state)
                 action = torch.argmax(action_values).item()
         else:
@@ -204,7 +204,7 @@ def train(params: Params = None, env: gym.Env = None, agent: DQN = None):
             agent.target.load_state_dict(agent.policy.state_dict())
 
         if not (epoch + 1) % params.save_freq:
-            print(f"回合:{epoch + 1}/{params.epochs}, 奖励:{immediately_rewards[-1]:.2f}")
+            print(f"回合:{epoch + 1}/{params.epochs}, 平均奖励:{np.array(immediately_rewards).mean():.2f}")
             np.save(f"./data/dqn_immediately_rewards{epoch + 1}.npy", np.array(immediately_rewards))
             torch.save(agent.policy.state_dict(), f"./data/dqn_policy_epoch{epoch + 1}.pt")
     env.close()
@@ -224,7 +224,7 @@ def dqn():
 
 
 def plot_rewards():
-    data = np.load("./data/dqn_immediately_rewards400.npy")
+    data = np.load("./data/dqn_immediately_rewards1000.npy")
     plt.xlabel("episodes")
     plt.ylabel("immediately_rewards")
     plt.plot(data, label='rewards')
@@ -234,5 +234,5 @@ def plot_rewards():
 
 
 if __name__ == "__main__":
-    dqn()
-    # plot_rewards()
+    # dqn()
+    plot_rewards()
