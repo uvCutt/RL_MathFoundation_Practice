@@ -14,29 +14,28 @@ import matplotlib.pyplot as plt
 class Params:
     device = "cpu"
     env_name = "CartPole-v1"
+
     # 动作空间和状态空间以及隐藏层大小
     action_space_size = 0
     state_space_size = 0
     hidden_dim = 256
-    # 学习率和折扣率, 很关键的参数!!! 调的时候一度怀疑自己的代码是否写错, 实际上就是参数问题
-    lr = 0.0001
+    # 学习率和折扣率
+    lr = 0.001
     gamma = 0.99
 
-    # 传统指数衰减epsilon = max_epsilon * exp(-gama * count)
-    max_epsilon = 0.95
-    min_epsilon = 0.01
-    exp_decay_rate = 0.002
+    # 探索率
+    epsilon = 0.01
 
     # 训练次数以及每次最大步长
-    epochs = 2000
-    episode_len = 100000
+    epochs = 400
+    episode_len = 200
     # 经验回放池大小
-    replay_buffer_size = 100000
+    replay_buffer_size = 1000
 
     batch_size = 64
 
     # 更新target的频率以及保存频率
-    target_update_freq = 4
+    target_update_freq = 5
     save_freq = 10
 
 
@@ -80,7 +79,8 @@ class ReplayBuffer(object):
         if batch_size > len(self.buffer):
             batch_size = len(self.buffer)
         batch = random.sample(self.buffer, batch_size)
-        return zip(*batch)
+        states, actions, rewards, next_states, dones = zip(*batch)
+        return np.array(states), actions, rewards, np.array(next_states), dones
 
     def __len__(self):
         return len(self.buffer)
@@ -90,8 +90,7 @@ class DQN:
     def __init__(self, params: Params = None, model: nn.Module = None, replay_buffer: ReplayBuffer = None):
         self.params = params
 
-        self.epsilon = self.params.max_epsilon
-        self.exp_decay_count = 0
+        self.epsilon = self.params.epsilon
 
         self.policy = model.to(self.params.device)
         self.target = model.to(self.params.device)
@@ -113,28 +112,21 @@ class DQN:
             return
 
         states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
-        states = torch.tensor(np.array(states))
-        actions = torch.tensor(actions)
-        rewards = torch.tensor(rewards)
-        next_states = torch.tensor(np.array(next_states))
-        dones = torch.tensor(dones)
-
+        states = torch.tensor(states).to(self.params.device)
+        actions = torch.tensor(actions).view(-1, 1).to(self.params.device)
+        rewards = torch.tensor(rewards).view(-1, 1).to(self.params.device)
+        next_states = torch.tensor(next_states).to(self.params.device)
+        dones = torch.tensor(dones).view(-1, 1).to(self.params.device)
         # DQN的目标函数的计算公式
-        # 这里就是DQN的贡献之二:使用两个网络,只更新policy,不更新target
-        state_action_values = self.policy(states)
-        next_state_action_values = self.target(next_states).detach()
+        q_values = self.policy(states).gather(dim=1, index=actions)
+        next_q_values, _ = torch.max(self.target(next_states), dim=1)
         # 计算预测值以及目标值
-        q_values = state_action_values.gather(dim=1, index=actions.unsqueeze(1)).squeeze()
-        max_action_values, indexes = torch.max(next_state_action_values, dim=1)
-        q_targets = rewards + self.params.gamma * (max_action_values * (1 - dones))
+        q_targets = rewards + self.params.gamma * (next_q_values.view(-1, 1) * (1 - dones))
         # 计算均方误差
-        loss = nn.MSELoss()(q_values, q_targets)
+        loss = torch.mean(nn.MSELoss()(q_values, q_targets))
         # 优化
         self.optimizer.zero_grad()
         loss.backward()
-        # 限制梯度
-        for param in self.policy.parameters():
-            param.grad.data.clamp_(-1, 1)
         self.optimizer.step()
 
     def sample_action(self, state: np.ndarray) -> int:
@@ -143,27 +135,17 @@ class DQN:
         :param state: 当前状态
         :return: 执行的动作
         """
-        self.exp_decay()
         if random.random() > self.epsilon:
             with torch.no_grad():
-                action_values = self.policy(torch.tensor(state))
+                state = torch.tensor([state], dtype=torch.float).to(self.params.device)
+                action_values = self.policy(state)
                 action = torch.argmax(action_values).item()
         else:
-            action = random.randrange(self.params.action_space_size)
+            action = np.random.randint(self.params.action_space_size)
         return action
 
-    def exp_decay(self) -> None:
-        """
-        指数衰减公式: epsilon = max_epsilon * exp(-gama * count)
-        限制一下最小的探索率
-        :return: None
-        """
-        self.exp_decay_count += 1
-        self.epsilon = self.params.max_epsilon * math.exp(-self.params.exp_decay_rate * self.exp_decay_count)
-        self.epsilon = max(self.epsilon, self.params.min_epsilon)
 
-
-def smooth(data: np.ndarray, weight=0.9) -> list:
+def smooth(data: np.ndarray, weight=0.8) -> list:
     """
     绘制平滑曲线
     :param data: 数据
@@ -197,10 +179,10 @@ def env_seed(seed: int = 1) -> None:
 
 
 def train(params: Params = None, env: gym.Env = None, agent: DQN = None):
-    immediately_rewards = np.zeros(shape=params.epochs, dtype=float)
+    immediately_rewards = []
 
     for epoch in range(params.epochs):
-        immediately_reward = 0
+        rewards = []
         state, info = env.reset()
 
         for step in range(params.episode_len):
@@ -210,18 +192,20 @@ def train(params: Params = None, env: gym.Env = None, agent: DQN = None):
             agent.replay_buffer.push([state, action, reward, next_state, int(done)])
 
             state = next_state
+            rewards.append(reward)
             agent.update()
-            immediately_reward += reward
             if done:
-                immediately_rewards[epoch] = immediately_reward
                 break
+
+        rewards = np.array(rewards)
+        immediately_rewards.append(rewards.sum())
 
         if not ((epoch + 1) % params.target_update_freq):
             agent.target.load_state_dict(agent.policy.state_dict())
 
         if not (epoch + 1) % params.save_freq:
-            print(f"回合:{epoch + 1}/{params.epochs}, 奖励:{immediately_reward:.2f}, epsilon:{agent.epsilon:.3f}")
-            np.save(f"./data/dqn_immediately_rewards{epoch + 1}.npy", immediately_rewards[:epoch])
+            print(f"回合:{epoch + 1}/{params.epochs}, 奖励:{immediately_rewards[-1]:.2f}")
+            np.save(f"./data/dqn_immediately_rewards{epoch + 1}.npy", np.array(immediately_rewards))
             torch.save(agent.policy.state_dict(), f"./data/dqn_policy_epoch{epoch + 1}.pt")
     env.close()
 
@@ -240,7 +224,7 @@ def dqn():
 
 
 def plot_rewards():
-    data = np.load("./data/dqn_immediately_rewards200.npy")[:100]
+    data = np.load("./data/dqn_immediately_rewards400.npy")
     plt.xlabel("episodes")
     plt.ylabel("immediately_rewards")
     plt.plot(data, label='rewards')
