@@ -20,7 +20,6 @@ class Params:
     hidden_dim = 128
     # 动作的最大最小值
     action_max = 0
-    action_min = 0
     # 学习率和折扣率
     actor_lr = 0.001
     critic_lr = 0.001
@@ -90,7 +89,7 @@ class PolicyNet(nn.Module):
         x = nn.ReLU()(self.input_linear(x))
         x = nn.ReLU()(self.hidden_linear(x))
         x = nn.Tanh()(self.output_linear(x))
-        x = self.params.action_min + (self.params.action_max - self.params.action_min) * x
+        x = self.params.action_max * x
         return x
 
 
@@ -144,6 +143,8 @@ class TD3:
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=self.params.critic_lr)
         self.replay_buffer = replay_buffer
 
+        self.count = 0
+
     def soft_update(self):
         for param, param_target in zip(self.actor.parameters(), self.actor_target.parameters()):
             param_target.data.copy_(param_target.data * (1.0 - self.params.tau) + param.data * self.params.tau)
@@ -167,21 +168,33 @@ class TD3:
         next_states = torch.tensor(next_states, dtype=torch.float).to(self.params.device)
         dones = torch.tensor(dones).view(-1, 1).to(self.params.device)
 
+        # 策略平滑
+        with torch.no_grad():
+            next_actions = self.actor(states)
+            noise = torch.randn_like(actions) * self.params.epsilon
+            noise = torch.clamp(noise, -self.params.noise_clip, self.params.noise_clip)
+            noise_actions = torch.clamp(noise + next_actions, -self.params.action_max, self.params.action_max)
 
-        next_q_values = self.critic_target(next_states, self.actor_target(next_states))
-        q_targets = rewards + self.params.gamma * next_q_values * (1 - dones)
+            next_q_values = torch.min(*self.critic_target(next_states, noise_actions))
+            q_targets = rewards + self.params.gamma * next_q_values * (1 - dones)
 
-        critic_loss = torch.mean(nn.MSELoss()(self.critic(states, actions), q_targets))
+        # 计算critic loss并更新
+        cur_targets, cur_targets_another = self.critic(states, actions)
+        critic_loss = nn.MSELoss()(cur_targets, q_targets) + nn.MSELoss()(cur_targets_another, q_targets)
+
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
         self.critic_optimizer.step()
 
-        actor_loss = -torch.mean(self.critic(states, self.actor(states)))
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        self.actor_optimizer.step()
+        if not self.count % self.params.policy_update_freq:
+            actor_loss = -torch.mean(self.critic.single_q(states, self.actor(states)))
 
-        self.soft_update()
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            self.actor_optimizer.step()
+            self.soft_update()
+
+        self.count += 1
 
     def sample_action(self, state: np.ndarray) -> int:
         """
@@ -191,11 +204,13 @@ class TD3:
         """
         state = torch.tensor(state).to(self.params.device)
         action = self.actor(state)
-        noise_action = torch.randn_like(action) * self.params.epsilon
-        noise_action = torch.clamp(noise_action, -self.params.noise_clip, self.params.noise_clip)
-        noise_action = torch.clamp(noise_action, self.params.action_min, self.params.action_max)
 
-        return noise_action.detach().item()
+        # noise_action = torch.randn_like(action) * self.params.epsilon
+        # noise_action = torch.clamp(noise_action, -self.params.noise_clip, self.params.noise_clip)
+        # noise_action = torch.clamp(noise_action, self.params.action_min, self.params.action_max)
+        # return noise_action.detach().item()
+
+        return action.detach()
 
 
 def smooth(data: np.ndarray, weight=0.9) -> list:
@@ -242,7 +257,6 @@ def train(params: Params = None, env: gym.Env = None, agent: TD3 = None):
             next_state, reward, done, _, _ = env.step(action)
 
             agent.replay_buffer.push([state, action, reward, next_state, int(done)])
-
             state = next_state
             rewards.append(reward)
             agent.update()
@@ -263,7 +277,6 @@ def td3():
     env = gym.make(params.env_name)
     params.action_space_size = env.action_space.shape[0]
     params.state_space_size = env.observation_space.shape[0]
-    params.action_min = env.action_space.low[0]
     params.action_max = env.action_space.high[0]
     params.action_space_size = env.action_space.shape[0]
     replay_buffer = ReplayBuffer(params.replay_buffer_size)
